@@ -1,155 +1,218 @@
-# Idempotency-Gateway (The "Pay-Once" Protocol)
+# Idempotency Gateway — the "Pay-Once" Protocol
 
-This challenge is designed to test your ability to bridge Computer Science fundamentals with Modern Backend Engineering.
+A Spring Boot service for **FinSafe Transactions Ltd.** that guarantees a payment request is processed **exactly once**, no matter how many times the client retries it.
 
-## 1. Business Context
-
-> **Client:** _FinSafe Transactions Ltd._ (A fast-growing Payment Processor).
-
-### The Problem
-
-FinSafe's clients (e-commerce shops) occasionally experience network timeouts. When this happens, their servers automatically retry sending payment requests. Recently, this has led to a critical issue: **Double Charging**.
-
-If a customer clicks "Pay," the request is sent, but the network lags. The client retries the request. FinSafe processes _both_ requests, charging the customer twice. This is causing customer churn and regulatory headaches.
-
-### The Solution
-
-FinSafe needs you to build an **Idempotency Layer**. This is a middleware service (or API) that ensures no matter how many times a client sends the same request, the payment is processed **exactly once**.
+Clients send a unique `Idempotency-Key` header with each payment. The first request is processed and its response stored. Any retry with the same key gets the stored response back instantly, without charging again.
 
 ---
 
-## 2. Technical Objective
+## Architecture
 
-Build a RESTful API that mimics a payment processing backend. It must check for a unique `Idempotency-Key` in the HTTP headers.
+### Sequence diagram
 
-- **First Request:** Process the payment and save the response.
-- **Duplicate Request:** Detect the existing key and return the _saved_ response immediately, without processing the payment again.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Client (Request A)
+    participant B as Client (Request B, same key)
+    participant G as Gateway
+    participant S as Idempotency Store
+    participant P as Payment Processor
 
----
+    A->>G: POST /process-payment (Key=K, body X)
+    G->>S: putIfAbsent(K, record{hash(X), pending})
+    S-->>G: claimed (A is the owner)
+    G->>P: charge(X) [~2s]
 
-## 3. Getting Started
+    B->>G: POST /process-payment (Key=K, body X)
+    G->>S: putIfAbsent(K, ...)
+    S-->>G: existing record (in-flight)
+    G->>G: hash matches, wait on record.future
 
-1.  **Fork this Repository:** Do not clone it directly. Create a fork to your own GitHub account.
-2.  **Environment:** You may use **Node.js, Python, Java or Go, etc.**. You may use any database or in-memory store (Redis, SQLite, or a simple native Map/Dictionary variable).
-3.  **Submission:** Your final submission will be a link to your forked repository containing the source code and documentation.
+    P-->>G: charged
+    G->>S: complete(record.future, 201 + body)
+    G-->>A: 201 Created
+    G-->>B: 201 Created + X-Cache-Hit: true (same body)
+```
 
----
+### Flowchart
 
-## 4. The Architecture Diagram
-
-**Task:** Before you write any code, you must design the logic flow.
-**Deliverable:** A **Sequence Diagram** or **Flowchart** included in your README.
-
----
-
-## 5. User Stories & Acceptance Criteria
-
-### User Story 1: The First Transaction (Happy Path)
-
-**As a** client system (e.g., an online store),
-**I want to** send a payment request with a unique ID,
-**So that** my transaction is processed successfully.
-
-**Acceptance Criteria:**
-
-- [ ] The API accepts a `POST` request to endpoint `/process-payment`.
-- [ ] The request header must contain `Idempotency-Key: <some-unique-string>`.
-- [ ] The request body accepts a JSON object (e.g., `{"amount": 100, "currency": "GHS"}`).
-- [ ] The server simulates processing (e.g., a 2-second delay) and returns a `200 OK` or `201 Created` response.
-- [ ] The response body should include a status message: `"Charged 100 GHS"`.
-
-### User Story 2: The Duplicate Attempt (Idempotency Logic)
-
-**As a** client system,
-**I want to** safely retry a request if I don't hear back,
-**So that** I don't accidentally double-charge the user.
-
-**Acceptance Criteria:**
-
-- [ ] If the client sends a second `POST` request with the **same** `Idempotency-Key` and payload:
-  - [ ] The server must **NOT** run the processing logic again (no 2-second delay).
-  - [ ] The server must return the **exact same** response body and status code as the first successful request.
-  - [ ] The server returns a header `X-Cache-Hit: true` to indicate this was a replayed response.
-
-### User Story 3: Different Request, Same Key (Fraud/Error Check)
-
-**As a** security officer,
-**I want to** reject requests that reuse keys for different payments,
-**So that** we maintain data integrity.
-
-**Acceptance Criteria:**
-
-- [ ] If a request arrives with an existing `Idempotency-Key` but a **different** request body (e.g., changing amount from 100 to 500):
-  - [ ] The server must return a `422 Unprocessable Entity` or `409 Conflict` error.
-  - [ ] The error message should state: `"Idempotency key already used for a different request body."`
+```mermaid
+flowchart TD
+    Start([POST /process-payment]) --> H{Idempotency-Key header present and body valid?}
+    H -- No --> E400[400 Bad Request]
+    H -- Yes --> Claim[Atomic putIfAbsent key]
+    Claim --> New{Key was new?}
+    New -- Yes --> Proc[Process payment ~2s]
+    Proc --> OK{Succeeded?}
+    OK -- Yes --> Save[Complete record with 201 + body]
+    Save --> R201[Return 201]
+    OK -- No --> Free[Remove key, fail waiters] --> E500[500, safe to retry]
+    New -- No --> Same{Same body hash?}
+    Same -- No --> E422[422 Idempotency key already used for a different request body.]
+    Same -- Yes --> Done{Original still in flight?}
+    Done -- Yes --> Wait[Block until original finishes]
+    Done -- No --> Replay
+    Wait --> Replay[Return stored response + X-Cache-Hit: true]
+```
 
 ---
 
-## 6. Bonus User Story (The "In-Flight" Check)
+## Setup
 
-**As a** system architect,
-**I want to** handle cases where two identical requests arrive at the exact same time,
-**So that** we don't succumb to race conditions.
+**Requirements:** Java 17+ and Maven 3.6+.
 
-**Scenario:** Request A arrives. While Request A is still "processing" (during the 2-second delay), Request B (same key) arrives.
+```bash
+git clone <your-fork-url>
+cd idempotency-gateway
 
-**Acceptance Criteria:**
+# run
+mvn spring-boot:run
 
-- [ ] Request B should not start a new process.
-- [ ] Request B should not return `409 Conflict`.
-- [ ] Request B should wait (block) until Request A finishes, and then return the result of Request A.
+# or build a jar
+mvn clean package
+java -jar target/idempotency-gateway-1.0.0.jar
 
----
+# run tests
+mvn test
+```
 
-## 7. The "Developer's Choice" Challenge
+The server starts on **http://localhost:8080**.
 
-We believe great engineers are also product thinkers.
+### Configuration (`src/main/resources/application.properties`)
 
-**Task:** Identify **one** additional feature or safety mechanism that would make this system better for a real-world Fintech company.
-
-1.  **Implement it.**
-2.  **Document it:** Explain _why_ you added it in your README.
-
----
-
-## 8. Documentation Requirements
-
-Your final `README.md` must replace these instructions. It must cover:
-
-1.  **Architecture Diagram**
-2.  **Setup Instructions**
-3.  **API Documentation**
-4.  **Design Decisions**
-5.  **The Developer's Choice:** Description of the extra feature you added.
+| Property | Default | Meaning |
+|---|---|---|
+| `server.port` | `8080` | HTTP port |
+| `payment.processing-delay-ms` | `2000` | Simulated payment latency |
+| `idempotency.ttl-seconds` | `86400` | How long a key is remembered (24h) |
+| `idempotency.cleanup-interval-ms` | `60000` | How often expired keys are swept |
 
 ---
 
-Submit your repo link via the [online](https://forms.cloud.microsoft/e/bLyGT3byxx) form.
+## API Documentation
+
+### `POST /process-payment`
+
+| | |
+|---|---|
+| **Header** | `Idempotency-Key: <unique string>` (required, max 255 chars) |
+| **Header** | `Content-Type: application/json` |
+| **Body** | `{"amount": <number >= 0.01>, "currency": "<3-letter code>"}` |
+
+#### 1. First request (happy path)
+
+```bash
+curl -i -X POST http://localhost:8080/process-payment \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: order-1001" \
+  -d '{"amount": 100, "currency": "GHS"}'
+```
+
+Takes about 2 seconds:
+
+```
+HTTP/1.1 201
+Content-Type: application/json
+
+{"status":"Charged 100 GHS","transactionId":"6f1c...","amount":"100","currency":"GHS"}
+```
+
+#### 2. Duplicate request (replay)
+
+Run the same command again. It returns immediately with the identical status and body, plus:
+
+```
+HTTP/1.1 201
+X-Cache-Hit: true
+
+{"status":"Charged 100 GHS","transactionId":"6f1c...","amount":"100","currency":"GHS"}
+```
+
+The `transactionId` is the same as the first response, which proves nothing was re-processed.
+
+#### 3. Same key, different body
+
+```bash
+curl -i -X POST http://localhost:8080/process-payment \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: order-1001" \
+  -d '{"amount": 500, "currency": "GHS"}'
+```
+
+```
+HTTP/1.1 422
+{"error":"Idempotency key already used for a different request body."}
+```
+
+#### 4. In-flight duplicates (bonus)
+
+Fire two identical requests at the same time:
+
+```bash
+for i in 1 2; do
+  curl -s -i -X POST http://localhost:8080/process-payment \
+    -H "Content-Type: application/json" -H "Idempotency-Key: order-2002" \
+    -d '{"amount": 75, "currency": "USD"}' &
+done; wait
+```
+
+Both return `201` after about 2 seconds (not 4). They share the same `transactionId`, and only the second carries `X-Cache-Hit: true`.
+
+#### Error responses
+
+| Status | When |
+|---|---|
+| `400` | Missing/blank `Idempotency-Key`, malformed JSON, or invalid `amount`/`currency` |
+| `422` | Key reused with a different request body |
+| `500` | Processing failed. The key is released, so retrying with the same key is safe |
+
+### `GET /health`
+Returns `{"status":"UP"}`.
 
 ---
 
-## 🛑 Pre-Submission Checklist
+## Design Decisions
 
-**WARNING:** Before you submit your solution, you **MUST** pass every item on this list.
-If you miss any of these critical steps, your submission will be **automatically rejected** and you will **NOT** be invited to an interview.
-
-### 1. 📂 Repository & Code
-
-- [ ] **Public Access:** Is your GitHub repository set to **Public**? (We cannot review private repos).
-- [ ] **Clean Code:** Did you remove unnecessary files (like `node_modules`, `.env` with real keys, or `.DS_Store`)?
-- [ ] **Run Check:** if we clone your repo and run `npm start` (or equivalent), does the server start immediately without crashing?
-
-### 2. 📄 Documentation (Crucial)
-
-- [ ] **Architecture Diagram:** Did you include a visual Diagram (Flowchart or Sequence Diagram) in the README?
-- [ ] **README Swap:** Did you **DELETE** the original instructions (the problem brief) from this file and replace it with your own documentation?
-- [ ] **API Docs:** Is there a clear list of Endpoints and Example Requests in the README?
-
-### 3. 🧹 Git Hygiene
-
-- [ ] **Commit History:** Does your repo have multiple commits with meaningful messages? (A single "Initial Commit" is a red flag).
+- **Atomic claim with `ConcurrentHashMap.putIfAbsent`.** The first thread to insert a key becomes its owner. Every other thread sees the existing record. This removes the check-then-act race, so there is no explicit locking.
+- **`CompletableFuture` per key for in-flight handling.** The owner completes the future when the payment finishes. Duplicates that arrive mid-flight call `future.get()` and block, then return the same result. They never start new work and never get a 409.
+- **Body fingerprint (SHA-256 of a canonical form).** The fingerprint is computed from the *parsed* request (`amount` normalised via `stripTrailingZeros`, currency upper-cased), not the raw bytes. So `100` vs `100.00`, whitespace and key order don't trigger false conflicts, while a real change like 100 → 500 does.
+- **422 for key reuse.** The request is well-formed but semantically unacceptable, which fits 422 better than 409.
+- **Failures aren't cached.** If processing throws, the key is removed so the client can retry. Caching a failed charge forever would make the payment impossible to complete.
+- **In-memory store.** The brief allows it, and it keeps setup to a single command. The `IdempotencyService` is the only class that touches the store, so swapping in Redis (`SET key NX` plus a pub/sub or polling wait) is a contained change. See *Limitations*.
+- **Replays return the original status code and body**, with `X-Cache-Hit: true` added.
 
 ---
 
-**Ready?**
-If you checked all the boxes above, submit your repository link in the application form. Good luck! 🚀
+## Developer's Choice: Key Expiry (TTL) with Automatic Eviction
+
+**What:** Every idempotency record has a time-to-live (default 24h, configurable). A scheduled job (`IdempotencyService.evictExpired`) periodically removes completed records older than the TTL. In-flight records are never evicted.
+
+**Why:** In a payments system, the idempotency store sits on the hot path of every transaction. Without expiry:
+
+1. **Memory grows without bound.** Every payment ever made stays in the map until the service falls over.
+2. **Keys are retry-scoped, not forever-scoped.** Retries happen within seconds or hours. After a day, a reused key is almost certainly a client bug, and 24h is the window used by well-known payment APIs such as Stripe.
+
+The TTL is a property (`idempotency.ttl-seconds`), so operations can tune it without a code change.
+
+---
+
+## Limitations / Next Steps
+
+- The store is **in-memory and per-instance**. Running multiple instances behind a load balancer, or restarting, loses keys. For production, move the store to Redis (atomic `SET NX` with expiry) or a database with a unique constraint on the key.
+- Keys are global. In a multi-tenant system they should be scoped per merchant (e.g. `merchantId:key`).
+
+---
+
+## Project Structure
+
+```
+src/main/java/com/finsafe/idempotency/
+├── IdempotencyGatewayApplication.java
+├── controller/PaymentController.java      # HTTP layer, headers, status codes
+├── service/IdempotencyService.java        # claim / wait / replay / TTL eviction
+├── service/PaymentProcessor.java          # simulated 2s payment provider
+├── model/                                 # request, response, stored record
+└── exception/                             # conflict exception + global handler
+src/test/java/.../IdempotencyGatewayTests.java   # happy path, replay, conflict, concurrency
+```
